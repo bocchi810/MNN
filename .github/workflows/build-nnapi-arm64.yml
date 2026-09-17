@@ -1,0 +1,144 @@
+name: build-nnapi-arm64
+
+# 手动触发：Actions 页面点 "Run workflow"
+on:
+  workflow_dispatch:
+    inputs:
+      build_llm:
+        description: '是否构建 LLM 部分（MNN_BUILD_LLM）'
+        type: boolean
+        default: true
+      run_on_push:
+        description: '仅用于测试：本文件被推送时是否自动构建一次'
+        type: boolean
+        default: false
+  push:
+    paths:
+      - '.github/workflows/build-nnapi-arm64.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: 判断是否该跑（push 触发时需要显式打开）
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ inputs.run_on_push }}" != "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "push 触发且未勾选 run_on_push，跳过构建。"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 检出源码
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/checkout@v4
+
+      - name: 安装 CMake 3.28（避开 CMP0175：MNN 给 OBJECT 库挂 POST_BUILD）
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          python3 -m pip install --quiet "cmake==3.28.3"
+          cmake --version
+
+      - name: 安装 Android NDK r27c
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -e
+          curl -sSL -o ndk.zip https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+          unzip -q ndk.zip
+          echo "ANDROID_NDK=$PWD/android-ndk-r27c" >> "$GITHUB_ENV"
+          echo "NDK 就绪: $(ls -d $PWD/android-ndk-r27c)"
+
+      - name: 配置（arm64-v8a + NNAPI）
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -e
+          mkdir -p build-nnapi && cd build-nnapi
+          cmake .. \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_STL=c++_shared \
+            -DANDROID_NATIVE_API_LEVEL=android-21 \
+            -DANDROID_PLATFORM=android-21 \
+            -DMNN_USE_LOGCAT=true \
+            -DMNN_ARM82=true \
+            -DMNN_OPENCL=true \
+            -DMNN_LOW_MEMORY=true \
+            -DMNN_SUPPORT_TRANSFORMER_FUSE=true \
+            -DMNN_BUILD_LLM=${{ inputs.build_llm == false && 'false' || 'true' }} \
+            -DMNN_NNAPI=true \
+            -DMNN_BUILD_BENCHMARK=true \
+            -DMNN_BUILD_DEMO=true \
+            -DMNN_BUILD_TOOLS=true \
+            -DMNN_BUILD_TEST=false \
+            -DMNN_SEP_BUILD=false \
+            -DMNN_BUILD_FOR_ANDROID_COMMAND=true
+          # 为什么需要最后这个开关（已本地逐条验证）：
+          # MNN 官方 3.6.1 的 transformers/llm/engine/CMakeLists.txt:72-81 给 OBJECT 库 llm
+          # 挂了 add_custom_command(... POST_BUILD ...)，CMake 会直接报错：
+          #   Target "llm" is an OBJECT library that may not have PRE_BUILD/PRE_LINK/POST_BUILD
+          #   commands.
+          # 该分支的条件是 (Android AND NOT MNN_BUILD_FOR_ANDROID_COMMAND)，加上这个开关即走
+          # 官方 ELSE 分支（INSTALL 头文件）。它的其它副作用都在 IF(MNN_SEP_BUILD) 内，而我们
+          # 用的是 MNN_SEP_BUILD=false，因此这里只起到"绕开非法 POST_BUILD"的作用。
+          # 好处：fork 里无需修改任何 MNN 源码。
+          grep -E "^MNN_NNAPI" CMakeCache.txt
+
+      - name: 编译
+        if: steps.gate.outputs.skip != 'true'
+        run: cmake --build build-nnapi -j"$(nproc)"
+
+      - name: 校验 NNAPI 后端确实编进去了（缺失则本 job 失败）
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -e
+          LIB=$(find build-nnapi -name "libMNN.so" | head -1)
+          echo "libMNN.so: $LIB"
+          file "$LIB"
+          echo "--- NNAPI 后端符号（应能看到 NNAPIBackend 相关符号）---"
+          nm -C --defined-only "$LIB" 2>/dev/null | grep -i "nnapi" | head -20
+          if ! nm -C --defined-only "$LIB" | grep -qi "nnapi"; then
+            echo "::error::libMNN.so 里没有 NNAPI 符号，说明 MNN_NNAPI 没生效"
+            exit 1
+          fi
+          echo "--- 确认没有任何 NeuroPilot 残留（3.6.x 已移出公开仓库）---"
+          if nm -C --defined-only "$LIB" | grep -qi "neuropilot"; then
+            echo "::warning::出现 NeuroPilot 符号，请检查源码版本"
+          fi
+          echo "OK: NNAPI 后端已在 libMNN.so 中"
+
+      - name: 打包产物 + 设备自检包
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -e
+          mkdir -p out/lib out/bin
+          # 动态库
+          find build-nnapi -name "*.so" -exec cp -v {} out/lib/ \;
+          # 自检/基准工具
+          for t in benchmark.out backendTest.out MNNV2Basic.out GetMNNInfo; do
+            f=$(find build-nnapi -name "$t" -type f | head -1)
+            if [ -n "$f" ]; then cp -v "$f" out/bin/; else echo "未找到 $t（跳过）"; fi
+          done
+          # 小 CNN 模型：NNAPI 覆盖得住的场景，用于设备自检
+          mkdir -p out/models
+          cp -v benchmark/models/mobilenet-v1-1.0.mnn out/models/ 2>/dev/null || true
+          cp -v benchmark/models/SqueezeNetV1.0.mnn out/models/ 2>/dev/null || true
+          (cd out && find . -type f -exec sha256sum {} \; | sort -k2 > SHA256SUMS.txt)
+          tar czf mnn-nnapi-arm64.tar.gz -C out .
+          ls -la mnn-nnapi-arm64.tar.gz
+
+      - name: 上传产物
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mnn-nnapi-arm64
+          path: |
+            mnn-nnapi-arm64.tar.gz
+            out/
+          if-no-files-found: error
