@@ -97,21 +97,36 @@ jobs:
       - name: 校验 NNAPI 后端确实编进去了（缺失则本 job 失败）
         if: steps.gate.outputs.skip != 'true'
         run: |
-          set -e
-          LIB=$(find build-nnapi -name "libMNN.so" | head -1)
+          set -euo pipefail
+          LIB=$(find build-nnapi -maxdepth 1 -name "libMNN.so" | head -1)
           echo "libMNN.so: $LIB"
           file "$LIB"
-          echo "--- NNAPI 后端符号（应能看到 NNAPIBackend 相关符号）---"
-          nm -C --defined-only "$LIB" 2>/dev/null | grep -i "nnapi" | head -20
-          if ! nm -C --defined-only "$LIB" | grep -qi "nnapi"; then
-            echo "::error::libMNN.so 里没有 NNAPI 符号，说明 MNN_NNAPI 没生效"
+
+          # 注意：发布用的 libMNN.so 是 stripped 的，普通 `nm` 会直接报 "no symbols"，
+          # 所以下面三种证据都必须对 stripped 产物有效。
+          echo "--- 证据1/3：字符串表里的 NNAPI 运行时与日志标记 ---"
+          strings -a "$LIB" | grep -E "libneuralnetworks\.so|\[NNAPI\]" | sort -u | head -20
+
+          echo "--- 证据2/3：动态符号表（NNAPI 后端注册函数）---"
+          (readelf --dyn-syms -W "$LIB" 2>/dev/null || true) | grep -i "nnapi" | head -20
+
+          echo "--- 证据3/3：未 strip 的目标文件里的后端实现符号 ---"
+          OBJ=$(find build-nnapi -name "NNAPIBackend.cpp.o" | head -1)
+          echo "目标文件: $OBJ"
+          nm -C --defined-only "$OBJ" 2>/dev/null | grep -i "nnapi" | head -10
+
+          HIT_STR=0; strings -a "$LIB" | grep -q "libneuralnetworks\.so" && HIT_STR=1
+          HIT_OBJ=0; [ -n "$OBJ" ] && nm -C --defined-only "$OBJ" 2>/dev/null | grep -qi "nnapi" && HIT_OBJ=1
+          if [ "$HIT_STR" -eq 0 ] && [ "$HIT_OBJ" -eq 0 ]; then
+            echo "::error::既没有 libneuralnetworks.so 引用、也没有 NNAPI 目标文件符号，MNN_NNAPI 很可能没生效"
             exit 1
           fi
+          echo "OK: NNAPI 后端已编入（字符串证据=$HIT_STR，目标文件符号证据=$HIT_OBJ）"
+
           echo "--- 确认没有任何 NeuroPilot 残留（3.6.x 已移出公开仓库）---"
-          if nm -C --defined-only "$LIB" | grep -qi "neuropilot"; then
-            echo "::warning::出现 NeuroPilot 符号，请检查源码版本"
+          if strings -a "$LIB" | grep -qi "neuropilot"; then
+            echo "::warning::出现 NeuroPilot 字符串，请检查源码版本"
           fi
-          echo "OK: NNAPI 后端已在 libMNN.so 中"
 
       - name: 打包产物 + 设备自检包
         if: steps.gate.outputs.skip != 'true'
