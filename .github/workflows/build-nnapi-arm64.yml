@@ -223,7 +223,12 @@ jobs:
           mkdir -p out/models
           cp -v benchmark/models/mobilenet-v1-1.0.mnn out/models/ 2>/dev/null || true
           cp -v benchmark/models/SqueezeNetV1.0.mnn out/models/ 2>/dev/null || true
-          (cd out && find . -type f -exec sha256sum {} \; | sort -k2 > SHA256SUMS.txt)
+          # 生成校验清单：必须排除 SHA256SUMS.txt 自身
+          # （上一版把它也算进去了，导致自引用——先算出的哈希在写入后立刻失效，
+          #   本地 `sha256sum -c` 会报 SHA256SUMS.txt: FAILED）
+          (cd out && find . -type f ! -name SHA256SUMS.txt -exec sha256sum {} \; | sort -k2 > SHA256SUMS.txt)
+          echo "--- 校验清单自检 ---"
+          (cd out && sha256sum -c SHA256SUMS.txt)
           tar czf mnn-nnapi-arm64.tar.gz -C out .
           ls -la mnn-nnapi-arm64.tar.gz
 
