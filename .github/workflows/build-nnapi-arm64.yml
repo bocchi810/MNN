@@ -98,34 +98,51 @@ jobs:
         if: steps.gate.outputs.skip != 'true'
         run: |
           set -euo pipefail
+          # 上一版两次踩坑，这里全部规避：
+          #  1) 发布用 libMNN.so 是 stripped 的，`nm` 只会回 "no symbols" —— 不能作为判据；
+          #  2) 开启 pipefail 后，`grep` 无匹配返回 1、`head` 提前关闭管道使上游收到 SIGPIPE(141)，
+          #     都会让脚本在判定之前就退出（上一版误报"缺少 NNAPI"就是这么来的）。
+          # 因此：先把 strings 落成文件，再在文件上统计与截断，全程不做短管道。
           LIB=$(find build-nnapi -maxdepth 1 -name "libMNN.so" | head -1)
           echo "libMNN.so: $LIB"
-          file "$LIB"
+          command -v file >/dev/null && file "$LIB" || echo "(file 命令不可用，跳过架构打印)"
+          strings -a "$LIB" > /tmp/libMNN.strings
 
-          # 注意：发布用的 libMNN.so 是 stripped 的，普通 `nm` 会直接报 "no symbols"，
-          # 所以下面三种证据都必须对 stripped 产物有效。
-          echo "--- 证据1/3：字符串表里的 NNAPI 运行时与日志标记 ---"
-          strings -a "$LIB" | grep -E "libneuralnetworks\.so|\[NNAPI\]" | sort -u | head -20
+          echo "--- 证据1/3：字符串表里的 NNAPI 日志标记 ---"
+          STR_HITS=$(grep -c -E "libneuralnetworks\.so|\[NNAPI\]" /tmp/libMNN.strings || true)
+          grep -E "libneuralnetworks\.so|\[NNAPI\]" /tmp/libMNN.strings | sort -u > /tmp/nnapi-hits.txt || true
+          sed -n '1,15p' /tmp/nnapi-hits.txt
+          echo "字符串命中数: $STR_HITS"
 
-          echo "--- 证据2/3：动态符号表（NNAPI 后端注册函数）---"
-          (readelf --dyn-syms -W "$LIB" 2>/dev/null || true) | grep -i "nnapi" | head -20
+          echo "--- 证据2/3：动态符号表（strip 后 .dynsym 保留，但不保证含 nnapi 字样）---"
+          readelf --dyn-syms -W "$LIB" > /tmp/libMNN.dynsyms 2>/dev/null || true
+          DYNSYM_HITS=$(grep -c -i "nnapi" /tmp/libMNN.dynsyms || true)
+          echo "动态符号命中数: $DYNSYM_HITS"
 
           echo "--- 证据3/3：未 strip 的目标文件里的后端实现符号 ---"
           OBJ=$(find build-nnapi -name "NNAPIBackend.cpp.o" | head -1)
           echo "目标文件: $OBJ"
-          nm -C --defined-only "$OBJ" 2>/dev/null | grep -i "nnapi" | head -10
+          OBJ_HITS=0
+          if [ -n "$OBJ" ]; then
+            nm -C --defined-only "$OBJ" > /tmp/nnapi-obj.syms 2>/dev/null || true
+            OBJ_HITS=$(grep -c -i "nnapi" /tmp/nnapi-obj.syms || true)
+            grep -i "nnapi" /tmp/nnapi-obj.syms > /tmp/nnapi-syms.txt || true
+            sed -n '1,6p' /tmp/nnapi-syms.txt
+          fi
+          echo "目标文件符号命中数: $OBJ_HITS"
 
-          HIT_STR=0; strings -a "$LIB" | grep -q "libneuralnetworks\.so" && HIT_STR=1
-          HIT_OBJ=0; [ -n "$OBJ" ] && nm -C --defined-only "$OBJ" 2>/dev/null | grep -qi "nnapi" && HIT_OBJ=1
-          if [ "$HIT_STR" -eq 0 ] && [ "$HIT_OBJ" -eq 0 ]; then
-            echo "::error::既没有 libneuralnetworks.so 引用、也没有 NNAPI 目标文件符号，MNN_NNAPI 很可能没生效"
+          if [ "${STR_HITS:-0}" -eq 0 ] && [ "${OBJ_HITS:-0}" -eq 0 ]; then
+            echo "::error::既没有 NNAPI 字符串、也没有 NNAPI 目标文件符号，MNN_NNAPI 很可能没生效"
             exit 1
           fi
-          echo "OK: NNAPI 后端已编入（字符串证据=$HIT_STR，目标文件符号证据=$HIT_OBJ）"
+          echo "OK: NNAPI 后端已编入（字符串命中 $STR_HITS，目标文件符号命中 $OBJ_HITS）"
 
           echo "--- 确认没有任何 NeuroPilot 残留（3.6.x 已移出公开仓库）---"
-          if strings -a "$LIB" | grep -qi "neuropilot"; then
+          NP_HITS=$(grep -c -i "neuropilot" /tmp/libMNN.strings || true)
+          if [ "${NP_HITS:-0}" -gt 0 ]; then
             echo "::warning::出现 NeuroPilot 字符串，请检查源码版本"
+          else
+            echo "无 NeuroPilot 残留（符合 3.6.1 已移出公开仓库的事实）"
           fi
 
       - name: 打包产物 + 设备自检包
