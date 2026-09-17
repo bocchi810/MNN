@@ -39,20 +39,67 @@ jobs:
         if: steps.gate.outputs.skip != 'true'
         uses: actions/checkout@v4
 
-      - name: 安装 CMake 3.28（避开 CMP0175：MNN 给 OBJECT 库挂 POST_BUILD）
+      - name: 安装 CMake 3.28（存在则跳过）（避开 CMP0175：MNN 给 OBJECT 库挂 POST_BUILD）
         if: steps.gate.outputs.skip != 'true'
         run: |
-          python3 -m pip install --quiet "cmake==3.28.3"
-          cmake --version
+          set -e
+          # runner 预装的是 CMake 3.31.5 / 4.1.2，都 ≥3.31，配 MNN 会撞 CMP0175；
+          # 这里固定 3.28.3。注意 3.31.5 那套也救不了（该限制与 policy 版本无关）。
+          if ! cmake --version | head -1 | grep -q "3\.28\.3"; then
+            python3 -m pip install --quiet "cmake==3.28.3"
+          fi
+          cmake --version | head -1
+
+      - name: 安装 ccache（编译对象缓存，命中时大幅缩短重编时间）
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -e
+          if ! command -v ccache >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ccache
+          fi
+          ccache --version | head -1
+
+      - name: 缓存 NDK r27c（避免每次重下 665MB）
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/cache@v6
+        with:
+          path: android-ndk-r27c
+          key: android-ndk-r27c-linux
+
+      - name: 缓存 ccache 对象文件
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ github.sha }}-${{ inputs.build_llm }}
+          restore-keys: |
+            ccache-
 
       - name: 安装 Android NDK r27c
         if: steps.gate.outputs.skip != 'true'
         run: |
           set -e
-          curl -sSL -o ndk.zip https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
-          unzip -q ndk.zip
+          if [ ! -d android-ndk-r27c ]; then
+            curl -sSL -o ndk.zip https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+            unzip -q ndk.zip
+            rm -f ndk.zip
+          else
+            echo "NDK 命中缓存，跳过下载"
+          fi
           echo "ANDROID_NDK=$PWD/android-ndk-r27c" >> "$GITHUB_ENV"
-          echo "NDK 就绪: $(ls -d $PWD/android-ndk-r27c)"
+          echo "NDK 就绪: $ANDROID_NDK"
+
+      - name: 配置 ccache（大小上限 1G，避免挤占仓库 10GB 缓存配额）
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -e
+          ccache --set-config=max_size=1G
+          ccache --set-config=compression=false
+          ccache --set-config=base_dir="$GITHUB_WORKSPACE"
+          ccache -z          # 清零统计，便于看本次命中率
+          ccache -p | grep -E "max_size|base_dir|compression"
+          ccache -s | head -5
 
       - name: 配置（arm64-v8a + NNAPI）
         if: steps.gate.outputs.skip != 'true'
@@ -62,6 +109,8 @@ jobs:
           cmake .. \
             -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_STL=c++_shared \
             -DANDROID_NATIVE_API_LEVEL=android-21 \
@@ -93,6 +142,14 @@ jobs:
       - name: 编译
         if: steps.gate.outputs.skip != 'true'
         run: cmake --build build-nnapi -j"$(nproc)"
+
+      - name: ccache 命中率报告
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          echo "=== ccache 统计（本次）==="
+          ccache -s
+          echo "=== ccache 目录占用 ==="
+          du -sh ~/.cache/ccache 2>/dev/null || true
 
       - name: 校验 NNAPI 后端确实编进去了（缺失则本 job 失败）
         if: steps.gate.outputs.skip != 'true'
