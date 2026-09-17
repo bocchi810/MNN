@@ -72,9 +72,14 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.cache/ccache
-          key: ccache-${{ github.sha }}-${{ inputs.build_llm }}
+          # 滚动 key：Actions 的缓存条目一经写入不可覆盖（immutable），所以 key 里放 run_id
+          # 让每次运行都写一份新快照，restore-keys 再取最近一份来复用。
+          # 反过来若把 commit sha 放进 key，就会每次改工作流都换新 key、永远命不中——ccache 等于白加。
+          # 源码变化本身由 ccache 按内容哈希判断，不需要体现在 key 里。
+          # 配额：ccache 上限 1G + NDK 约 2G，远低于仓库默认 10G。
+          key: ccache-nnapi-v1-${{ github.run_id }}
           restore-keys: |
-            ccache-
+            ccache-nnapi-v1-
 
       - name: 安装 Android NDK r27c
         if: steps.gate.outputs.skip != 'true'
