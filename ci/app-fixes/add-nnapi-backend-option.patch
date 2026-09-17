@@ -1,0 +1,66 @@
+--- a/apps/Android/MnnLlmChat/app/src/main/java/com/alibaba/mnnllm/android/modelsettings/SettingsBottomSheetFragment.kt
++++ b/apps/Android/MnnLlmChat/app/src/main/java/com/alibaba/mnnllm/android/modelsettings/SettingsBottomSheetFragment.kt
+@@ -20,6 +20,7 @@
+ import com.alibaba.mnnllm.android.modelist.ModelListManager
+ import com.alibaba.mnnllm.android.modelsettings.ModelConfig.Companion.defaultConfig
+ import com.alibaba.mnnllm.android.utils.MmapUtils
++import com.google.android.material.dialog.MaterialAlertDialogBuilder
+ import java.util.Locale
+ 
+ enum class SamplerType(val value: String) {
+@@ -142,7 +143,13 @@
+         }
+ 
+         // Backend
+-        val backendOptions = listOf("cpu", "opencl")
++        // LOCAL PATCH: 增加 "npu"（NNAPI）选项。MNN 的 LLM 引擎本身认识这个值，
++        // 见 transformers/llm/engine/src/llm.cpp:52 `if (type_str == "npu") return MNN_FORWARD_NN;`。
++        // 但必须清楚：MNN 的 NNAPI 后端只注册 22 个算子（Conv/Pool/激活/逐元素等），
++        // 没有 MatMul / Attention，因此对 LLM 没有加速作用，选中后会逐算子回退 CPU。
++        // 保留该选项是为了能用这份带 NNAPI 的构建实测 NNAPI 路径，
++        // 选择时给出明确警告，避免误以为"开了 NPU 就更快"。
++        val backendOptions = listOf("cpu", "opencl", "npu")
+         val currentBackend = currentConfig.backendType.takeIf { it in backendOptions } ?: "cpu"
+         binding.dropdownBackend.setCurrentItem(currentBackend)
+         binding.dropdownBackend.setDropDownItems(
+@@ -150,6 +157,18 @@
+             itemToString = { it.toString() },
+             onDropdownItemSelected = { _, item ->
+                 val selectedBackend = item.toString()
++                if (selectedBackend.equals("npu", ignoreCase = true)) {
++                    showNnapiWarningDialog(
++                        onProceed = {
++                            currentConfig.backendType = selectedBackend
++                            binding.dropdownBackend.setCurrentItem(selectedBackend)
++                        },
++                        onCancel = {
++                            binding.dropdownBackend.setCurrentItem(currentBackend)
++                        }
++                    )
++                    return@setDropDownItems
++                }
+                 if (!selectedBackend.equals("opencl", ignoreCase = true)) {
+                     currentConfig.backendType = selectedBackend
+                     return@setDropDownItems
+@@ -182,6 +201,21 @@
+         )
+     }
+ 
++    // LOCAL PATCH: NNAPI 后端选择警告。文案里写清"对 LLM 不会加速"的原因
++    //（NNAPI 后端无 MatMul/Attention 算子），避免把它当成加速开关。
++    private fun showNnapiWarningDialog(onProceed: () -> Unit, onCancel: () -> Unit) {
++        MaterialAlertDialogBuilder(requireContext())
++            .setTitle("NNAPI (NPU) 后端说明")
++            .setMessage(
++                "MNN 的 NNAPI 后端只实现了卷积、池化、激活等 22 个算子，没有 MatMul 与 Attention。\n\n" +
++                    "因此对 LLM 不会带来加速：这些算子会逐个回退到 CPU，反而可能更慢。\n\n" +
++                    "它的适用范围是 CNN / 视觉类模型。是否仍要切换到 NNAPI？"
++            )
++            .setNegativeButton(android.R.string.cancel) { _, _ -> onCancel() }
++            .setPositiveButton("仍要使用") { _, _ -> onProceed() }
++            .show()
++    }
++
+     private fun shouldWarnWhenSelectingOpenCl(): Boolean {
+         if (modelId.isBlank()) {
+             return false

@@ -1,0 +1,236 @@
+name: build-apk-nnapi
+
+# 产出可安装的 APK（官方 MNN Chat App，编译时打开 NNAPI）
+on:
+  workflow_dispatch:
+    inputs:
+      build_llm:
+        description: '是否构建 LLM 部分（MNN_BUILD_LLM）'
+        type: boolean
+        default: true
+  push:
+    paths:
+      - '.github/workflows/build-apk-nnapi.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: 判断是否该跑（push 触发不自动构建）
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "push 触发：跳过。请到 Actions 页面手动 Run workflow。"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 检出源码（MNN 3.6.1 原样，未改一行）
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/checkout@v4
+
+      - name: 安装 Java 17（AGP 8.x 要求）
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 安装 ccache
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -e
+          if ! command -v ccache >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ccache
+          fi
+          ccache --version | head -1
+
+      - name: 缓存 NDK（避免每次重下）
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/cache@v6
+        with:
+          path: android-ndk-r27c
+          key: android-ndk-r27c-linux
+
+      - name: 安装 NDK r27c（= App build.gradle 要求的 27.2.12479018）
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -e
+          if [ ! -d android-ndk-r27c ]; then
+            curl -sSL -o ndk.zip https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+            unzip -q ndk.zip && rm -f ndk.zip
+          else
+            echo "NDK 命中缓存"
+          fi
+          echo "ANDROID_NDK=$PWD/android-ndk-r27c" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$PWD/android-ndk-r27c" >> "$GITHUB_ENV"
+
+      - name: 缓存 ccache（编译对象）
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ccache
+          # 与库构建分开一套 key，避免两种 CMake 配置互相污染缓存
+          key: ccache-apk-v1-${{ github.run_id }}
+          restore-keys: |
+            ccache-apk-v1-
+            ccache-nnapi-v1-
+
+      - name: 配置 ccache
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -e
+          ccache --set-config=max_size=1G
+          ccache --set-config=compression=false
+          ccache --set-config=base_dir="$GITHUB_WORKSPACE"
+          ccache -z
+          ccache -p | grep -E "max_size|base_dir"
+
+      - name: 应用 UI 补丁（在设置页加入 NNAPI 选项 + 警告弹窗）
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -e
+          echo "--- 补丁内容 ---"
+          cat ci/app-fixes/add-nnapi-backend-option.patch
+          echo "--- 干跑校验 ---"
+          patch -p1 --dry-run < ci/app-fixes/add-nnapi-backend-option.patch
+          patch -p1 < ci/app-fixes/add-nnapi-backend-option.patch
+          echo "--- 确认已改上去 ---"
+          grep -n 'listOf("cpu", "opencl", "npu")' apps/Android/MnnLlmChat/app/src/main/java/com/alibaba/mnnllm/android/modelsettings/SettingsBottomSheetFragment.kt
+
+      - name: 构建 MNN 原生库（官方 App 参数 + NNAPI）
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -e
+          cd project/android
+          mkdir -p build_64 && cd build_64
+          ../build_64.sh "\
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+          -DMNN_LOW_MEMORY=true \
+          -DMNN_CPU_WEIGHT_DEQUANT_GEMM=true \
+          -DMNN_BUILD_LLM=${{ inputs.build_llm == false && 'false' || 'true' }} \
+          -DMNN_SUPPORT_TRANSFORMER_FUSE=true \
+          -DMNN_ARM82=true \
+          -DMNN_USE_LOGCAT=true \
+          -DMNN_OPENCL=true \
+          -DLLM_SUPPORT_VISION=true \
+          -DMNN_BUILD_OPENCV=true \
+          -DMNN_IMGCODECS=true \
+          -DLLM_SUPPORT_AUDIO=true \
+          -DMNN_BUILD_AUDIO=true \
+          -DMNN_BUILD_DIFFUSION=ON \
+          -DMNN_SEP_BUILD=OFF \
+          -DBUILD_PLUGIN=ON \
+          -DMNN_QNN=OFF \
+          -DMNN_NNAPI=ON \
+          -DMNN_BUILD_FOR_ANDROID_COMMAND=true \
+          -DCMAKE_SHARED_LINKER_FLAGS='-Wl,-z,max-page-size=16384' \
+          -DCMAKE_INSTALL_PREFIX=."
+          make install -j"$(nproc)"
+          echo "--- 安装出来的库 ---"
+          ls -la lib/
+          grep -E "^MNN_NNAPI" CMakeCache.txt
+
+      - name: 校验 libMNN.so 带 NNAPI（缺了就让 job 失败）
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          LIB=project/android/build_64/lib/libMNN.so
+          ls -la "$LIB"
+          strings -a "$LIB" > /tmp/lib.strings
+          STR_HITS=$(grep -c -E "libneuralnetworks\.so|\[NNAPI\]" /tmp/lib.strings || true)
+          OBJ=$(find project/android/build_64 -name "NNAPIBackend.cpp.o" | head -1)
+          OBJ_HITS=0
+          if [ -n "$OBJ" ]; then
+            nm -C --defined-only "$OBJ" > /tmp/obj.syms 2>/dev/null || true
+            OBJ_HITS=$(grep -c -i "nnapi" /tmp/obj.syms || true)
+          fi
+          echo "NNAPI 字符串命中=$STR_HITS，目标文件符号命中=$OBJ_HITS"
+          if [ "${STR_HITS:-0}" -eq 0 ] && [ "${OBJ_HITS:-0}" -eq 0 ]; then
+            echo "::error::libMNN.so 未包含 NNAPI 后端"
+            exit 1
+          fi
+
+      - name: 准备 App 构建（模型配置 / SDK 路径）
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -e
+          cd apps/Android/MnnLlmChat
+          # App 需要 model-config.json（仓库只带 .example）
+          if [ ! -f model-config.json ] && [ -f model-config.json.example ]; then
+            cp model-config.json.example model-config.json
+            echo "已从 model-config.json.example 生成 model-config.json"
+          fi
+          # 指向 runner 上的 Android SDK
+          echo "sdk.dir=${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}" > local.properties
+          cat local.properties
+          echo "--- 关键文件 ---"
+          ls -la model-config.json gradlew
+          java -version 2>&1 | head -2
+
+      - name: 构建 APK（assembleStandardDebug）
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -e
+          cd apps/Android/MnnLlmChat
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleStandardDebug
+          echo "--- 产物 ---"
+          find app/build/outputs -name "*.apk" -exec ls -la {} \;
+
+      - name: ccache 命中率
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          ccache -s | head -12
+
+      - name: 校验 APK（含 libMNN.so 且带 NNAPI / 含 npu 选项）
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          APK=$(find apps/Android/MnnLlmChat/app/build/outputs -name "*.apk" | head -1)
+          echo "APK: $APK"
+          ls -la "$APK"
+          mkdir -p apkcheck && cd apkcheck
+          unzip -o -q "../$APK"
+          echo "--- APK 内的 arm64 库 ---"
+          ls -la lib/arm64-v8a/ | head -20
+          if [ ! -f lib/arm64-v8a/libMNN.so ]; then
+            echo "::error::APK 里没有 lib/arm64-v8a/libMNN.so"
+            exit 1
+          fi
+          strings -a lib/arm64-v8a/libMNN.so > /tmp/apk-lib.strings
+          HITS=$(grep -c -E "libneuralnetworks\.so|\[NNAPI\]" /tmp/apk-lib.strings || true)
+          echo "APK 内 libMNN.so 的 NNAPI 字符串命中: $HITS"
+          if [ "${HITS:-0}" -eq 0 ]; then
+            echo "::error::APK 内的 libMNN.so 不带 NNAPI"
+            exit 1
+          fi
+          echo "--- APK 是否已签名 ---"
+          (command -v apksigner >/dev/null && apksigner verify --print-certs "../$APK" | head -5) || \
+            (unzip -l "../$APK" | grep -E "META-INF/.*\.(RSA|DSA|EC|SF)" || true)
+          echo "OK"
+
+      - name: 收集产物
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -e
+          mkdir -p apk-out
+          find apps/Android/MnnLlmChat/app/build/outputs -name "*.apk" -exec cp -v {} apk-out/ \;
+          (cd apk-out && find . -type f ! -name SHA256SUMS.txt -exec sha256sum {} \; | sort -k2 > SHA256SUMS.txt && cat SHA256SUMS.txt && sha256sum -c SHA256SUMS.txt)
+          ls -la apk-out/
+
+      - name: 上传 APK
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mnn-chat-apk-nnapi
+          path: apk-out/
+          if-no-files-found: error
